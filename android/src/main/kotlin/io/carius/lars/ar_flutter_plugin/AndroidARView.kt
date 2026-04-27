@@ -754,10 +754,18 @@ internal class AndroidARView(
             emptyList()
         }
 
-        // Prefer plane hits where the pose is inside the polygon and
-        // the plane is currently tracking; fall back to estimated
-        // surface-normal feature points; last resort: the first hit.
+        // Prefer HORIZONTAL_UPWARD_FACING planes (floor / tabletop),
+        // then any tracking plane inside its polygon, then estimated
+        // feature points, then the first raw hit. Biasing toward
+        // upward-facing horizontal surfaces keeps the prism on the
+        // ground rather than on a wall or ceiling.
         val firstHit = hits.firstOrNull { hit ->
+            val t = hit.trackable
+            t is Plane &&
+                t.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
+                t.trackingState == TrackingState.TRACKING &&
+                t.isPoseInPolygon(hit.hitPose)
+        } ?: hits.firstOrNull { hit ->
             val t = hit.trackable
             when (t) {
                 is Plane -> t.trackingState == TrackingState.TRACKING && t.isPoseInPolygon(hit.hitPose)

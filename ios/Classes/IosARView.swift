@@ -1201,10 +1201,19 @@ extension IosARView: ARCoachingOverlayViewDelegate {
         retriesLeft: Int,
         result: @escaping FlutterResult
     ) {
+        // Prefer horizontal surfaces (floor / ground / tabletop) so
+        // the prism lands on the ground rather than on a wall or a
+        // mid-air vertical estimated plane. Fall back to `.any` if
+        // no horizontal surface is found within the retry budget —
+        // some scenes (eg. a user standing right next to a wall)
+        // genuinely have no horizontal target nearby and we'd rather
+        // place imperfectly than not at all.
+        let alignment: ARRaycastQuery.TargetAlignment =
+            retriesLeft > 4 ? .horizontal : .any
         guard let query = sceneView.raycastQuery(
             from: screenPoint,
             allowing: .estimatedPlane,
-            alignment: .any
+            alignment: alignment
         ) else {
             result(false)
             return
