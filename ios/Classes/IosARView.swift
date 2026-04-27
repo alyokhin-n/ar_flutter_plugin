@@ -26,6 +26,11 @@ class IosARView: NSObject, FlutterPlatformView, ARSCNViewDelegate, UIGestureReco
     /// understanding evolves. Stop them via `stopTracking()` on node
     /// removal to free their per-frame budget.
     private var trackedRaycasts = [String: ARTrackedRaycast]()
+    /// Smoothed (low-pass filtered) target positions per node, used
+    /// to dampen ARKit's per-frame jitter in `trackedRaycast` results.
+    /// A raw write of every update produced visible drift because each
+    /// frame's plane estimate fluctuates by mm-cm even at rest.
+    private var smoothedSurfacePositions = [String: simd_float3]()
     
     private var cloudAnchorHandler: CloudAnchorHandler? = nil
     private var arcoreSession: GARSession? = nil
@@ -201,6 +206,7 @@ class IosARView: NSObject, FlutterPlatformView, ARSCNViewDelegate, UIGestureReco
                     if let tracked = trackedRaycasts.removeValue(forKey: name) {
                         tracked.stopTracking()
                     }
+                    smoothedSurfacePositions.removeValue(forKey: name)
                     sceneView.scene.rootNode.childNode(withName: name, recursively: true)?.removeFromParentNode()
                 }
                 break
@@ -1145,44 +1151,32 @@ extension IosARView: ARCoachingOverlayViewDelegate {
 
         let hits = sceneView.session.raycast(query)
         if let firstHit = hits.first {
-            // Migrate the seed → real surface SMOOTHLY. A direct
-            // `simdWorldPosition` assignment produced a visible
-            // teleport when the seed Y-guess didn't match the real
-            // floor; an SCNAction.move with ease-in-out makes the
-            // adjustment feel natural — like the prism is settling
-            // into place rather than snapping.
-            if let target = sceneView.scene.rootNode.childNode(
+            // Smooth seed → real-surface migration with completion
+            // handler. Direct `simdWorldPosition` writes from a
+            // trackedRaycast update fired *during* the SCNAction
+            // would overwrite the in-flight animation, producing
+            // the visible jump. Defer trackedRaycast registration
+            // until the migration animation finishes.
+            guard let target = sceneView.scene.rootNode.childNode(
                 withName: nodeName, recursively: true
-            ) {
-                let surfacePos = SCNVector3(
-                    firstHit.worldTransform.columns.3.x,
-                    firstHit.worldTransform.columns.3.y,
-                    firstHit.worldTransform.columns.3.z
-                )
-                let move = SCNAction.move(to: surfacePos, duration: 0.3)
-                move.timingMode = .easeInEaseOut
-                target.runAction(move)
+            ) else {
+                return
             }
-            // After the smooth migration, tracked raycast updates
-            // come from ARKit's continuous refinement. Direct
-            // `simdWorldPosition` writes are fine here — the
-            // updates are typically sub-cm and don't read as jumps.
-            let tracked = sceneView.session.trackedRaycast(query) { [weak self] (results) in
-                guard let self = self,
-                      let updated = results.first else { return }
-                if let target = self.sceneView.scene.rootNode.childNode(
-                    withName: nodeName, recursively: true
-                ) {
-                    let p = simd_float3(
-                        updated.worldTransform.columns.3.x,
-                        updated.worldTransform.columns.3.y,
-                        updated.worldTransform.columns.3.z
+            let surfacePos = SCNVector3(
+                firstHit.worldTransform.columns.3.x,
+                firstHit.worldTransform.columns.3.y,
+                firstHit.worldTransform.columns.3.z
+            )
+            let move = SCNAction.move(to: surfacePos, duration: 0.3)
+            move.timingMode = .easeInEaseOut
+            target.runAction(move) { [weak self] in
+                self?.startTrackedRefinement(
+                    query: query,
+                    nodeName: nodeName,
+                    initialSurfacePos: simd_float3(
+                        surfacePos.x, surfacePos.y, surfacePos.z
                     )
-                    target.simdWorldPosition = p
-                }
-            }
-            if let tracked = tracked {
-                trackedRaycasts[nodeName] = tracked
+                )
             }
             return
         }
@@ -1194,6 +1188,54 @@ extension IosARView: ARCoachingOverlayViewDelegate {
                 screenPoint: screenPoint,
                 retriesLeft: retriesLeft - 1
             )
+        }
+    }
+
+    /// Starts ARTrackedRaycast continuous refinement for the
+    /// migrated node. Each callback applies a low-pass filter
+    /// (`simd_mix(prev, new, 0.1)`) over ARKit's raw result before
+    /// writing to `simdWorldPosition` — the raw stream jitters by
+    /// mm-cm every frame even when the surface and camera are
+    /// stationary, which read as visible drift. With the filter,
+    /// the prism settles smoothly toward the true position over
+    /// ~10 frames and then holds there.
+    ///
+    /// Threshold guard: skip writes whose smoothed delta is < 1mm.
+    /// SceneKit can short-circuit transform updates this way and it
+    /// avoids the per-frame work of writing identical values.
+    private func startTrackedRefinement(
+        query: ARRaycastQuery,
+        nodeName: String,
+        initialSurfacePos: simd_float3
+    ) {
+        smoothedSurfacePositions[nodeName] = initialSurfacePos
+        let tracked = sceneView.session.trackedRaycast(query) { [weak self] (results) in
+            guard let self = self,
+                  let updated = results.first else { return }
+            guard let target = self.sceneView.scene.rootNode.childNode(
+                withName: nodeName, recursively: true
+            ) else { return }
+            let raw = simd_float3(
+                updated.worldTransform.columns.3.x,
+                updated.worldTransform.columns.3.y,
+                updated.worldTransform.columns.3.z
+            )
+            let prev = self.smoothedSurfacePositions[nodeName] ?? raw
+            // Exponential moving average — t=0.1 means each new
+            // result moves the smoothed position 10% of the way
+            // toward it, filtering out high-frequency jitter while
+            // still tracking real movement.
+            let smoothed = simd_mix(prev, raw, simd_float3(repeating: 0.1))
+            // Skip if change is below 1mm — avoids per-frame writes
+            // for identical values once converged.
+            if simd_length(smoothed - prev) < 0.001 {
+                return
+            }
+            self.smoothedSurfacePositions[nodeName] = smoothed
+            target.simdWorldPosition = smoothed
+        }
+        if let tracked = tracked {
+            trackedRaycasts[nodeName] = tracked
         }
     }
 
@@ -1300,28 +1342,14 @@ extension IosARView: ARCoachingOverlayViewDelegate {
         node.simdWorldPosition = pos
         sceneView.scene.rootNode.addChildNode(node)
 
-        // Continuous refinement: ARKit re-runs the raycast each frame
-        // and calls back when the result changes. Updating
-        // `simdWorldPosition` (only) preserves scale + orientation
-        // baked in by the model builder.
-        let tracked = sceneView.session.trackedRaycast(query) { [weak self] (results) in
-            guard let self = self,
-                  let updated = results.first else { return }
-            if let target = self.sceneView.scene.rootNode.childNode(
-                withName: nodeName,
-                recursively: true
-            ) {
-                let p = simd_float3(
-                    updated.worldTransform.columns.3.x,
-                    updated.worldTransform.columns.3.y,
-                    updated.worldTransform.columns.3.z
-                )
-                target.simdWorldPosition = p
-            }
-        }
-        if let tracked = tracked {
-            trackedRaycasts[nodeName] = tracked
-        }
+        // Use the same smoothed continuous-refinement helper as the
+        // hybrid path. Without low-pass filtering, ARKit's per-frame
+        // surface-estimate jitter (mm-cm) reads as visible drift.
+        startTrackedRefinement(
+            query: query,
+            nodeName: nodeName,
+            initialSurfacePos: pos
+        )
 
         result(true)
     }
