@@ -1100,35 +1100,29 @@ extension IosARView: ARCoachingOverlayViewDelegate {
         }
     }
 
-    /// Returns a world-space position ~4m forward of the current
-    /// camera, dropped ~1.6m on Y so the prism sits near floor
-    /// level (assuming the user holds the phone roughly at chest
-    /// height) rather than floating mid-air or appearing inside
-    /// the user. Returns nil if no camera frame is available yet —
-    /// the caller should retry on the next render tick rather than
-    /// placing at the world origin (which would put the prism
-    /// wherever the session started, not where the user is now).
+    /// Returns a world-space position ~3m forward of the current
+    /// camera (horizontal projection so phone tilt doesn't skew
+    /// the seed), dropped ~1.0m on Y. This is a *guess* of where
+    /// the floor likely is — used only as a temporary visible seed
+    /// while the background raycast finds the actual surface.
+    /// Once raycast lands, the node is animated to the real
+    /// position so any seed-vs-truth mismatch resolves smoothly
+    /// instead of as a visible jump.
     private func computeCameraRelativePosition() -> simd_float3? {
         guard let frame = sceneView.session.currentFrame else {
             return nil
         }
         let cam = frame.camera.transform
         let camPos = simd_float3(cam.columns.3.x, cam.columns.3.y, cam.columns.3.z)
-        // -Z column is the camera's forward direction in world space.
-        // We project onto the horizontal plane (zero out Y) so the
-        // prism is placed *in front* of the user, not above/below
-        // depending on their phone tilt.
         let rawForward = simd_float3(
             -cam.columns.2.x, -cam.columns.2.y, -cam.columns.2.z
         )
         let horizontalForward = simd_normalize(simd_float3(
             rawForward.x, 0, rawForward.z
         ))
-        let distance: Float = 4.0
+        let distance: Float = 3.0
         let pos = camPos + horizontalForward * distance
-        // Drop ~1.6m on Y from camera height — roughly floor level
-        // when the user holds the phone at chest height.
-        return simd_float3(pos.x, pos.y - 1.6, pos.z)
+        return simd_float3(pos.x, pos.y - 1.0, pos.z)
     }
 
     private func startBackgroundRaycastMigration(
@@ -1137,25 +1131,42 @@ extension IosARView: ARCoachingOverlayViewDelegate {
         retriesLeft: Int
     ) {
         guard retriesLeft > 0 else { return }
+        // Prefer horizontal surfaces during the first ~1.5s of
+        // retries; widen to `.any` toward the end so we still
+        // place if the user is right next to a wall with nothing
+        // horizontal in view.
+        let alignment: ARRaycastQuery.TargetAlignment =
+            retriesLeft > 15 ? .horizontal : .any
         guard let query = sceneView.raycastQuery(
             from: screenPoint,
             allowing: .estimatedPlane,
-            alignment: .any
+            alignment: alignment
         ) else { return }
 
         let hits = sceneView.session.raycast(query)
         if let firstHit = hits.first {
-            // Migrate the existing node and start tracked refinement.
+            // Migrate the seed → real surface SMOOTHLY. A direct
+            // `simdWorldPosition` assignment produced a visible
+            // teleport when the seed Y-guess didn't match the real
+            // floor; an SCNAction.move with ease-in-out makes the
+            // adjustment feel natural — like the prism is settling
+            // into place rather than snapping.
             if let target = sceneView.scene.rootNode.childNode(
                 withName: nodeName, recursively: true
             ) {
-                let p = simd_float3(
+                let surfacePos = SCNVector3(
                     firstHit.worldTransform.columns.3.x,
                     firstHit.worldTransform.columns.3.y,
                     firstHit.worldTransform.columns.3.z
                 )
-                target.simdWorldPosition = p
+                let move = SCNAction.move(to: surfacePos, duration: 0.3)
+                move.timingMode = .easeInEaseOut
+                target.runAction(move)
             }
+            // After the smooth migration, tracked raycast updates
+            // come from ARKit's continuous refinement. Direct
+            // `simdWorldPosition` writes are fine here — the
+            // updates are typically sub-cm and don't read as jumps.
             let tracked = sceneView.session.trackedRaycast(query) { [weak self] (results) in
                 guard let self = self,
                       let updated = results.first else { return }
