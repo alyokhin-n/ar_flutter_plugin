@@ -1169,15 +1169,16 @@ extension IosARView: ARCoachingOverlayViewDelegate {
             )
             let move = SCNAction.move(to: surfacePos, duration: 0.3)
             move.timingMode = .easeInEaseOut
-            target.runAction(move) { [weak self] in
-                self?.startTrackedRefinement(
-                    query: query,
-                    nodeName: nodeName,
-                    initialSurfacePos: simd_float3(
-                        surfacePos.x, surfacePos.y, surfacePos.z
-                    )
-                )
-            }
+            // No tracked refinement after migration — the node is
+            // pinned to scene root in fixed world coordinates. ARKit's
+            // continuous plane-estimate refinement was the source of
+            // visible "drift" on iPhone 11 (per-frame mm-cm jitter).
+            // Sacrificing automatic correction for major ARKit
+            // relocalization events in exchange for rock-solid
+            // visual stability is the right trade for this product
+            // (orienteering — short user sessions where relocalization
+            // rarely happens).
+            target.runAction(move)
             return
         }
 
@@ -1342,15 +1343,8 @@ extension IosARView: ARCoachingOverlayViewDelegate {
         node.simdWorldPosition = pos
         sceneView.scene.rootNode.addChildNode(node)
 
-        // Use the same smoothed continuous-refinement helper as the
-        // hybrid path. Without low-pass filtering, ARKit's per-frame
-        // surface-estimate jitter (mm-cm) reads as visible drift.
-        startTrackedRefinement(
-            query: query,
-            nodeName: nodeName,
-            initialSurfacePos: pos
-        )
-
+        // No tracked refinement — fixed-position placement. See
+        // comment in `startBackgroundRaycastMigration` for rationale.
         result(true)
     }
 }
