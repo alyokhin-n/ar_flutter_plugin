@@ -183,6 +183,46 @@ class ARObjectManager {
     }
   }
 
+  /// Place [node] at a real-world geographic coordinate
+  /// (`latitude`, `longitude`, optional `altitude`). Requires the
+  /// session to have been initialized with `enableGeoTracking: true`
+  /// (which switches iOS to `ARGeoTrackingConfiguration`).
+  ///
+  /// On iOS this routes to `ARGeoAnchor`, which is auto-refined by
+  /// ARKit as localization improves (Apple VPS in supported regions
+  /// — currently major US cities + select international metros;
+  /// GPS+heading fallback elsewhere with ~1-3m accuracy).
+  ///
+  /// On Android, ARCore Geospatial API support is **not yet wired**
+  /// in this plugin — requires per-app Google Cloud API key + service
+  /// setup. Returns `false` on Android until that integration lands.
+  Future<bool?> addNodeGeoAnchor(
+    ARNode node, {
+    required double latitude,
+    required double longitude,
+    double? altitude,
+  }) async {
+    try {
+      node.transformNotifier.addListener(() {
+        _channel.invokeMethod<void>('transformationChanged', {
+          'name': node.name,
+          'transformation':
+              MatrixValueNotifierConverter().toJson(node.transformNotifier),
+        });
+      });
+      final Map<String, dynamic> args = <String, dynamic>{
+        'node': node.toMap(),
+        'latitude': latitude,
+        'longitude': longitude,
+      };
+      if (altitude != null) args['altitude'] = altitude;
+      return await _channel.invokeMethod<bool>('addNodeGeoAnchor', args);
+    } on PlatformException catch (e) {
+      print('addNodeGeoAnchor: ' + e.toString());
+      return false;
+    }
+  }
+
   /// Remove given node from the AR Scene
   removeNode(ARNode node) {
     _channel.invokeMethod<String>('removeNode', {'name': node.name});

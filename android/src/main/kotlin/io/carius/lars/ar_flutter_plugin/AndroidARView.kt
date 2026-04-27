@@ -211,6 +211,18 @@ internal class AndroidARView(
                                 result.success(false)
                             }
                         }
+                        "addNodeGeoAnchor" -> {
+                            // Stub: ARCore Geospatial API requires per-app
+                            // Google Cloud API key + service setup. Until
+                            // that's wired, return false so the Dart side
+                            // can fall back to addNodeRaycast.
+                            Log.w(
+                                TAG,
+                                "addNodeGeoAnchor: Android Geospatial API not yet wired in this plugin. " +
+                                    "Returns false; use addNodeRaycast for now."
+                            )
+                            result.success(false)
+                        }
                         "removeNode" -> {
                             val nodeName: String? = call.argument<String>("name")
                             nodeName?.let{
@@ -795,7 +807,7 @@ internal class AndroidARView(
             placeNodeViaHitTest(dict_node, retriesLeft - 1)
                 .thenAccept { ok -> future.complete(ok) }
                 .exceptionally { t -> future.completeExceptionally(t); null }
-        }, 250)
+        }, 100)
     }
 
     private fun addNode(dict_node: HashMap<String, Any>, dict_anchor: HashMap<String, Any>? = null): CompletableFuture<Boolean>{

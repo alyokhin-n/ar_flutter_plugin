@@ -2,6 +2,7 @@ import Flutter
 import UIKit
 import Foundation
 import ARKit
+import CoreLocation
 import Combine
 import ARCoreCloudAnchors
 
@@ -30,6 +31,14 @@ class IosARView: NSObject, FlutterPlatformView, ARSCNViewDelegate, UIGestureReco
     private var arcoreSession: GARSession? = nil
     private var arcoreMode: Bool = false
     private var configuration: ARWorldTrackingConfiguration!
+    /// When non-nil, the session is running an `ARGeoTrackingConfiguration`
+    /// instead of (mutually-exclusive) `ARWorldTrackingConfiguration`. Geo
+    /// mode unlocks `ARGeoAnchor` (place virtual content at lat/lng/alt
+    /// that match real-world GPS). Requires iOS 14+, location permission,
+    /// device support, and (optionally) Apple's VPS coverage for sub-meter
+    /// accuracy. In Ukraine and most regions VPS is unavailable; ARKit
+    /// falls back to GPS+heading with ~1-3m accuracy.
+    private var geoConfiguration: Any? = nil  // ARGeoTrackingConfiguration when iOS 14+
     private var tappedPlaneAnchorAlignment = ARPlaneAnchor.Alignment.horizontal // default alignment
     
     private var panStartLocation: CGPoint?
@@ -162,6 +171,17 @@ class IosARView: NSObject, FlutterPlatformView, ARSCNViewDelegate, UIGestureReco
                     result: result
                 )
                 break
+            case "addNodeGeoAnchor":
+                if #available(iOS 14.0, *) {
+                    placeNodeViaGeoAnchor(arguments: arguments!, result: result)
+                } else {
+                    sessionManagerChannel.invokeMethod(
+                        "onError",
+                        arguments: ["addNodeGeoAnchor requires iOS 14+"]
+                    )
+                    result(false)
+                }
+                break
             case "removeNode":
                 if let name = arguments!["name"] as? String {
                     if let tracked = trackedRaycasts.removeValue(forKey: name) {
@@ -259,6 +279,27 @@ class IosARView: NSObject, FlutterPlatformView, ARSCNViewDelegate, UIGestureReco
     }
 
     func initializeARView(arguments: Dictionary<String,Any>, result: FlutterResult){
+        // Geo-tracking opt-in. When enabled and supported, swap world
+        // tracking for ARGeoTrackingConfiguration which enables
+        // ARGeoAnchor (lat/lng/alt-based placement). Apps must choose
+        // upfront — geo and world tracking are mutually exclusive.
+        if #available(iOS 14.0, *),
+           let enableGeo = arguments["enableGeoTracking"] as? Bool,
+           enableGeo,
+           ARGeoTrackingConfiguration.isSupported {
+            let geoConfig = ARGeoTrackingConfiguration()
+            geoConfig.planeDetection = [.horizontal, .vertical]
+            self.geoConfiguration = geoConfig
+            self.sceneView.session.run(geoConfig)
+            // Skip the rest of world-tracking-specific setup; geo
+            // mode does not use environmentTexturing, scene
+            // reconstruction, or worldAlignment in the same way.
+            self.sessionManagerChannel.invokeMethod(
+                "onError",
+                arguments: ["GeoTracking enabled — using ARGeoTrackingConfiguration. raycast / world-tracking features disabled in this mode."]
+            )
+            return
+        }
         // Set plane detection configuration
         self.configuration = ARWorldTrackingConfiguration()
         // Environment texturing is OFF by default — `.automatic` forces ARKit
@@ -276,6 +317,23 @@ class IosARView: NSObject, FlutterPlatformView, ARSCNViewDelegate, UIGestureReco
         if let align = arguments["worldAlignment"] as? String,
            align == "gravityAndHeading" {
             self.configuration.worldAlignment = .gravityAndHeading
+        }
+        // LiDAR scene reconstruction (iPhone 12 Pro+, iPad Pro). When
+        // enabled and supported, ARKit builds a real-time triangle mesh
+        // of the surroundings and exposes per-frame scene depth. This
+        // is the foundation for occluding virtual content by real
+        // furniture / walls. Older devices ignore the flag silently.
+        if #available(iOS 13.4, *),
+           let enableSR = arguments["enableSceneReconstruction"] as? Bool,
+           enableSR,
+           ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
+            self.configuration.sceneReconstruction = .mesh
+            // Smooth scene depth (LiDAR-only) gives the depth texture
+            // used by per-fragment occlusion shaders downstream.
+            if #available(iOS 14.0, *),
+               ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
+                self.configuration.frameSemantics.insert(.smoothedSceneDepth)
+            }
         }
         if let planeDetectionConfig = arguments["planeDetectionConfig"] as? Int {
             switch planeDetectionConfig {
@@ -854,6 +912,93 @@ extension IosARView: ARCoachingOverlayViewDelegate {
         self.sceneView.session.run(configuration, options: [.resetTracking])
     }
 
+    // MARK: - Geo-anchor placement (iOS 14+)
+
+    /// Place a node at a real-world geographic coordinate. Requires
+    /// the session to be running `ARGeoTrackingConfiguration` (set up
+    /// by passing `enableGeoTracking: true` to the init args). The
+    /// resulting `ARGeoAnchor` is automatically refined by ARKit as
+    /// the localization improves — Apple VPS in supported regions,
+    /// GPS+heading fallback elsewhere.
+    @available(iOS 14.0, *)
+    private func placeNodeViaGeoAnchor(
+        arguments: Dictionary<String, Any>,
+        result: @escaping FlutterResult
+    ) {
+        guard self.geoConfiguration != nil else {
+            sessionManagerChannel.invokeMethod(
+                "onError",
+                arguments: ["addNodeGeoAnchor: session is NOT running ARGeoTrackingConfiguration. Pass `enableGeoTracking: true` to onInitialize."]
+            )
+            result(false)
+            return
+        }
+        guard let dict_node = arguments["node"] as? Dictionary<String, Any>,
+              let lat = arguments["latitude"] as? Double,
+              let lng = arguments["longitude"] as? Double else {
+            result(false)
+            return
+        }
+        let altitudeOpt = arguments["altitude"] as? Double  // nil = ARKit infers ground level
+
+        let coord = CLLocationCoordinate2D(latitude: lat, longitude: lng)
+        let anchor: ARGeoAnchor
+        if let alt = altitudeOpt {
+            anchor = ARGeoAnchor(coordinate: coord, altitude: alt)
+        } else {
+            anchor = ARGeoAnchor(coordinate: coord)
+        }
+        let anchorName = (dict_node["name"] as? String) ?? UUID().uuidString
+        anchorCollection[anchorName] = anchor
+        sceneView.session.add(anchor: anchor)
+
+        // Build the node and parent it to the anchor's SCNNode once
+        // ARSCNView creates one. The renderer(_:didAdd:for:) callback
+        // handles ARGeoAnchor like any other anchor.
+        guard let nodeType = dict_node["type"] as? Int, nodeType == 0,
+              let uri = dict_node["uri"] as? String else {
+            sceneView.session.remove(anchor: anchor)
+            anchorCollection.removeValue(forKey: anchorName)
+            result(false)
+            return
+        }
+        let key = FlutterDartProject.lookupKey(forAsset: uri)
+        guard let node = self.modelBuilder.makeNodeFromGltf(
+            name: anchorName,
+            modelPath: key,
+            transformation: dict_node["transformation"] as? Array<NSNumber>
+        ) else {
+            sceneView.session.remove(anchor: anchor)
+            anchorCollection.removeValue(forKey: anchorName)
+            result(false)
+            return
+        }
+
+        // Wait briefly for the anchor's node to be created, then
+        // attach. ARGeoAnchor SCNNodes are created on the next render
+        // tick after `session.add`.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self = self else { return }
+            if let anchorNode = self.sceneView.node(for: anchor) {
+                anchorNode.addChildNode(node)
+                result(true)
+            } else {
+                // Retry once more
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                    guard let self = self else { return }
+                    if let anchorNode = self.sceneView.node(for: anchor) {
+                        anchorNode.addChildNode(node)
+                        result(true)
+                    } else {
+                        self.sceneView.session.remove(anchor: anchor)
+                        self.anchorCollection.removeValue(forKey: anchorName)
+                        result(false)
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: - Tracked-raycast placement
 
     private func sceneViewCenter() -> CGPoint {
@@ -900,7 +1045,7 @@ extension IosARView: ARCoachingOverlayViewDelegate {
             return
         }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
             self?.placeNodeViaTrackedRaycast(
                 dict_node: dict_node,
                 screenPoint: screenPoint,

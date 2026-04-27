@@ -162,6 +162,19 @@ class ARSessionManager {
     // for indoor; "gravityAndHeading" pulls yaw against compass and
     // is preferable outdoors when heading is reliable.
     String worldAlignment = 'gravity',
+    // iOS-only, LiDAR-only — enables ARKit scene reconstruction
+    // (real-time mesh of physical surroundings). Foundation for
+    // virtual-content occlusion by real-world objects. Silently
+    // ignored on devices without LiDAR (iPhone 11 / non-Pro models).
+    bool enableSceneReconstruction = false,
+    // Switches iOS to `ARGeoTrackingConfiguration` (mutually exclusive
+    // with world tracking). Unlocks `addNodeGeoAnchor` for placing
+    // virtual content at real-world lat/lng/alt that follows the user
+    // as they walk. Silently ignored on iOS < 14, on Android (until
+    // ARCore Geospatial API is wired), and on devices that don't
+    // support it. Disables raycast / scene-reconstruction features
+    // when active.
+    bool enableGeoTracking = false,
   }) {
     _channel.invokeMethod<void>('init', {
       'showAnimatedGuide': showAnimatedGuide,
@@ -175,6 +188,8 @@ class ARSessionManager {
       'handleRotation': handleRotation,
       'environmentTexturing': environmentTexturing,
       'worldAlignment': worldAlignment,
+      'enableSceneReconstruction': enableSceneReconstruction,
+      'enableGeoTracking': enableGeoTracking,
     });
   }
 
