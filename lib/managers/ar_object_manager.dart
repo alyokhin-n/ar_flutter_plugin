@@ -183,6 +183,45 @@ class ARObjectManager {
     }
   }
 
+  /// Hybrid placement: places [node] **immediately** at a camera-
+  /// relative seed position (no plane-detection wait), then in the
+  /// background runs raycast and migrates the node onto the first
+  /// detected real-world surface point — at which point continuous
+  /// drift correction kicks in (same as [addNodeRaycast]).
+  ///
+  /// Returns `true` as soon as the seed placement is done. The
+  /// surface migration happens asynchronously in native code and
+  /// produces no further Dart-side callback (the visible effect is
+  /// the node sliding onto the surface within ~0-3s).
+  ///
+  /// Best UX for "user-pointed AR" — instant visibility plus
+  /// drift-stable final placement. Currently `NodeType.localGLTF2`
+  /// only.
+  Future<bool?> addNodeHybrid(ARNode node, {Offset? screenPoint}) async {
+    try {
+      node.transformNotifier.addListener(() {
+        _channel.invokeMethod<void>('transformationChanged', {
+          'name': node.name,
+          'transformation':
+              MatrixValueNotifierConverter().toJson(node.transformNotifier),
+        });
+      });
+      final Map<String, dynamic> args = <String, dynamic>{
+        'node': node.toMap(),
+      };
+      if (screenPoint != null) {
+        args['screenPoint'] = <String, double>{
+          'x': screenPoint.dx,
+          'y': screenPoint.dy,
+        };
+      }
+      return await _channel.invokeMethod<bool>('addNodeHybrid', args);
+    } on PlatformException catch (e) {
+      print('addNodeHybrid: ' + e.toString());
+      return false;
+    }
+  }
+
   /// Place [node] at a real-world geographic coordinate
   /// (`latitude`, `longitude`, optional `altitude`). Requires the
   /// session to have been initialized with `enableGeoTracking: true`

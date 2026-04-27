@@ -211,6 +211,33 @@ internal class AndroidARView(
                                 result.success(false)
                             }
                         }
+                        "addNodeHybrid" -> {
+                            // Android equivalent of iOS hybrid placement:
+                            // ARCore Anchor on hit-test result already gets
+                            // continuous frame-by-frame refinement, so the
+                            // simplest hybrid is just `placeNodeViaHitTest`
+                            // — the worst-case retry budget is short
+                            // (12 × 100ms) and ARCore typically converges
+                            // plane detection in <500ms outdoors. Until we
+                            // build a proper Sceneform-side seed-then-migrate
+                            // flow, route hybrid to the same code path; the
+                            // user-facing latency on Android is already
+                            // close to the "instant" target.
+                            val dict_node: HashMap<String, Any>? =
+                                call.argument<HashMap<String, Any>>("node")
+                                    ?: call.arguments as? HashMap<String, Any>
+                            if (dict_node != null) {
+                                placeNodeViaHitTest(dict_node, retriesLeft = 12)
+                                    .thenAccept { status: Boolean ->
+                                        result.success(status)
+                                    }.exceptionally { throwable ->
+                                        result.error("e", throwable.message, throwable.stackTrace)
+                                        null
+                                    }
+                            } else {
+                                result.success(false)
+                            }
+                        }
                         "addNodeGeoAnchor" -> {
                             // Stub: ARCore Geospatial API requires per-app
                             // Google Cloud API key + service setup. Until

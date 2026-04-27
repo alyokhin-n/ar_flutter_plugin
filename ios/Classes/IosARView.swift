@@ -171,6 +171,20 @@ class IosARView: NSObject, FlutterPlatformView, ARSCNViewDelegate, UIGestureReco
                     result: result
                 )
                 break
+            case "addNodeHybrid":
+                let dict_node = (arguments!["node"] as? Dictionary<String, Any>) ?? arguments!
+                var screenPoint: CGPoint = self.sceneViewCenter()
+                if let sp = arguments!["screenPoint"] as? Dictionary<String, Any>,
+                   let x = sp["x"] as? Double,
+                   let y = sp["y"] as? Double {
+                    screenPoint = CGPoint(x: x, y: y)
+                }
+                placeNodeHybrid(
+                    dict_node: dict_node,
+                    screenPoint: screenPoint,
+                    result: result
+                )
+                break
             case "addNodeGeoAnchor":
                 if #available(iOS 14.0, *) {
                     placeNodeViaGeoAnchor(arguments: arguments!, result: result)
@@ -1003,6 +1017,141 @@ extension IosARView: ARCoachingOverlayViewDelegate {
 
     private func sceneViewCenter() -> CGPoint {
         return CGPoint(x: sceneView.bounds.midX, y: sceneView.bounds.midY)
+    }
+
+    /// Hybrid placement: instant camera-relative seed + background
+    /// migration to a tracked raycast result once ARKit finds a real
+    /// surface.
+    ///
+    /// Goal: best-of-both UX. The user sees the prism immediately on
+    /// AR view ready (no plane-detection wait) while the longer-term
+    /// drift-stable position is found in parallel. When the first
+    /// tracked-raycast update lands, the node's `simdWorldPosition`
+    /// is updated to the surface point and continuously refined
+    /// thereafter — same drift correction as the pure-raycast path.
+    private func placeNodeHybrid(
+        dict_node: [String: Any],
+        screenPoint: CGPoint,
+        result: @escaping FlutterResult
+    ) {
+        guard let nodeType = dict_node["type"] as? Int, nodeType == 0,
+              let nodeName = dict_node["name"] as? String,
+              let uri = dict_node["uri"] as? String else {
+            result(false)
+            return
+        }
+        let key = FlutterDartProject.lookupKey(forAsset: uri)
+        guard let node = self.modelBuilder.makeNodeFromGltf(
+            name: nodeName,
+            modelPath: key,
+            transformation: dict_node["transformation"] as? Array<NSNumber>
+        ) else {
+            self.sessionManagerChannel.invokeMethod(
+                "onError",
+                arguments: ["Unable to load renderable \(uri)"]
+            )
+            result(false)
+            return
+        }
+
+        // Stage 1 — instant placement at camera-relative spot.
+        // Reads the current frame's camera transform and projects
+        // forward by ~2m, lowered ~1m. Same math the legacy plain-
+        // `addNode` flow used; gives the user immediate visual
+        // feedback rather than a 0-1.5s wait for plane detection.
+        let initialPos = computeCameraRelativePosition()
+        node.simdWorldPosition = initialPos
+        sceneView.scene.rootNode.addChildNode(node)
+        result(true)
+
+        // Stage 2 — background raycast to find a real surface, then
+        // start tracked raycast and let ARKit refine `worldTransform`
+        // every frame. When the first valid hit comes in, migrate
+        // the node from the camera-relative seed to the surface
+        // point. From then on, drift correction is identical to the
+        // pure addNodeRaycast path.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            self?.startBackgroundRaycastMigration(
+                nodeName: nodeName,
+                screenPoint: screenPoint,
+                retriesLeft: 30   // ~3s at 100ms intervals
+            )
+        }
+    }
+
+    /// Returns a world-space position ~2m forward of the current
+    /// camera, dropped ~1m on Y so the prism sits near eye-level
+    /// floor-height rather than floating mid-air. If no current
+    /// frame is available (rare, only on the very first tick),
+    /// returns the world origin so the node still becomes visible.
+    private func computeCameraRelativePosition() -> simd_float3 {
+        guard let frame = sceneView.session.currentFrame else {
+            return simd_float3(0, 0, 0)
+        }
+        let cam = frame.camera.transform
+        let camPos = simd_float3(cam.columns.3.x, cam.columns.3.y, cam.columns.3.z)
+        // -Z column is the camera's forward direction in world space.
+        let forward = simd_normalize(simd_float3(
+            -cam.columns.2.x, -cam.columns.2.y, -cam.columns.2.z
+        ))
+        let distance: Float = 2.0
+        let pos = camPos + forward * distance
+        return simd_float3(pos.x, pos.y - 1.0, pos.z)
+    }
+
+    private func startBackgroundRaycastMigration(
+        nodeName: String,
+        screenPoint: CGPoint,
+        retriesLeft: Int
+    ) {
+        guard retriesLeft > 0 else { return }
+        guard let query = sceneView.raycastQuery(
+            from: screenPoint,
+            allowing: .estimatedPlane,
+            alignment: .any
+        ) else { return }
+
+        let hits = sceneView.session.raycast(query)
+        if let firstHit = hits.first {
+            // Migrate the existing node and start tracked refinement.
+            if let target = sceneView.scene.rootNode.childNode(
+                withName: nodeName, recursively: true
+            ) {
+                let p = simd_float3(
+                    firstHit.worldTransform.columns.3.x,
+                    firstHit.worldTransform.columns.3.y,
+                    firstHit.worldTransform.columns.3.z
+                )
+                target.simdWorldPosition = p
+            }
+            let tracked = sceneView.session.trackedRaycast(query) { [weak self] (results) in
+                guard let self = self,
+                      let updated = results.first else { return }
+                if let target = self.sceneView.scene.rootNode.childNode(
+                    withName: nodeName, recursively: true
+                ) {
+                    let p = simd_float3(
+                        updated.worldTransform.columns.3.x,
+                        updated.worldTransform.columns.3.y,
+                        updated.worldTransform.columns.3.z
+                    )
+                    target.simdWorldPosition = p
+                }
+            }
+            if let tracked = tracked {
+                trackedRaycasts[nodeName] = tracked
+            }
+            return
+        }
+
+        // No hit yet, retry shortly.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.startBackgroundRaycastMigration(
+                nodeName: nodeName,
+                screenPoint: screenPoint,
+                retriesLeft: retriesLeft - 1
+            )
+        }
     }
 
     /// Stable AR placement. Performs a one-shot raycast against
