@@ -1032,7 +1032,8 @@ extension IosARView: ARCoachingOverlayViewDelegate {
     private func placeNodeHybrid(
         dict_node: [String: Any],
         screenPoint: CGPoint,
-        result: @escaping FlutterResult
+        result: @escaping FlutterResult,
+        retriesLeft: Int = 10
     ) {
         guard let nodeType = dict_node["type"] as? Int, nodeType == 0,
               let nodeName = dict_node["name"] as? String,
@@ -1040,6 +1041,28 @@ extension IosARView: ARCoachingOverlayViewDelegate {
             result(false)
             return
         }
+
+        // Wait for the first camera frame before computing the seed
+        // position. Returning early-and-placing-at-origin (the
+        // previous behaviour) put the prism wherever the world
+        // session originated, which the user perceived as "appears
+        // inside me". Retry briefly until a frame is available.
+        guard let initialPos = computeCameraRelativePosition() else {
+            if retriesLeft <= 0 {
+                result(false)
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                self?.placeNodeHybrid(
+                    dict_node: dict_node,
+                    screenPoint: screenPoint,
+                    result: result,
+                    retriesLeft: retriesLeft - 1
+                )
+            }
+            return
+        }
+
         let key = FlutterDartProject.lookupKey(forAsset: uri)
         guard let node = self.modelBuilder.makeNodeFromGltf(
             name: nodeName,
@@ -1054,12 +1077,10 @@ extension IosARView: ARCoachingOverlayViewDelegate {
             return
         }
 
-        // Stage 1 — instant placement at camera-relative spot.
-        // Reads the current frame's camera transform and projects
-        // forward by ~2m, lowered ~1m. Same math the legacy plain-
-        // `addNode` flow used; gives the user immediate visual
-        // feedback rather than a 0-1.5s wait for plane detection.
-        let initialPos = computeCameraRelativePosition()
+        // Stage 1 — instant placement at camera-relative spot
+        // (~4m forward, dropped to floor level). User sees the
+        // prism right away while raycast finds the real surface
+        // in the background.
         node.simdWorldPosition = initialPos
         sceneView.scene.rootNode.addChildNode(node)
         result(true)
@@ -1079,24 +1100,35 @@ extension IosARView: ARCoachingOverlayViewDelegate {
         }
     }
 
-    /// Returns a world-space position ~2m forward of the current
-    /// camera, dropped ~1m on Y so the prism sits near eye-level
-    /// floor-height rather than floating mid-air. If no current
-    /// frame is available (rare, only on the very first tick),
-    /// returns the world origin so the node still becomes visible.
-    private func computeCameraRelativePosition() -> simd_float3 {
+    /// Returns a world-space position ~4m forward of the current
+    /// camera, dropped ~1.6m on Y so the prism sits near floor
+    /// level (assuming the user holds the phone roughly at chest
+    /// height) rather than floating mid-air or appearing inside
+    /// the user. Returns nil if no camera frame is available yet —
+    /// the caller should retry on the next render tick rather than
+    /// placing at the world origin (which would put the prism
+    /// wherever the session started, not where the user is now).
+    private func computeCameraRelativePosition() -> simd_float3? {
         guard let frame = sceneView.session.currentFrame else {
-            return simd_float3(0, 0, 0)
+            return nil
         }
         let cam = frame.camera.transform
         let camPos = simd_float3(cam.columns.3.x, cam.columns.3.y, cam.columns.3.z)
         // -Z column is the camera's forward direction in world space.
-        let forward = simd_normalize(simd_float3(
+        // We project onto the horizontal plane (zero out Y) so the
+        // prism is placed *in front* of the user, not above/below
+        // depending on their phone tilt.
+        let rawForward = simd_float3(
             -cam.columns.2.x, -cam.columns.2.y, -cam.columns.2.z
+        )
+        let horizontalForward = simd_normalize(simd_float3(
+            rawForward.x, 0, rawForward.z
         ))
-        let distance: Float = 2.0
-        let pos = camPos + forward * distance
-        return simd_float3(pos.x, pos.y - 1.0, pos.z)
+        let distance: Float = 4.0
+        let pos = camPos + horizontalForward * distance
+        // Drop ~1.6m on Y from camera height — roughly floor level
+        // when the user holds the phone at chest height.
+        return simd_float3(pos.x, pos.y - 1.6, pos.z)
     }
 
     private func startBackgroundRaycastMigration(
