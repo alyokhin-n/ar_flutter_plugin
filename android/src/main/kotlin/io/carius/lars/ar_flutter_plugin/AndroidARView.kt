@@ -85,6 +85,13 @@ internal class AndroidARView(
     private var footprintSelectionVisualizer = FootprintSelectionVisualizer()
     // Model builder
     private var modelBuilder = ArModelBuilder()
+
+    /// Anchors created by `addNodeRaycast`, keyed by node name.
+    /// ARCore Anchor poses are auto-refined every frame as the
+    /// session's world understanding evolves — that's how we get
+    /// drift-stable placement on Android (equivalent of iOS's
+    /// ARTrackedRaycast). Detach on node removal to free the budget.
+    private val nodeAnchors: MutableMap<String, com.google.ar.core.Anchor> = mutableMapOf()
     // Cloud anchor handler
     private lateinit var cloudAnchorHandler: CloudAnchorHandler
 
@@ -188,6 +195,22 @@ internal class AndroidARView(
                             }
 
                         }
+                        "addNodeRaycast" -> {
+                            val dict_node: HashMap<String, Any>? =
+                                call.argument<HashMap<String, Any>>("node")
+                                    ?: call.arguments as? HashMap<String, Any>
+                            if (dict_node != null) {
+                                placeNodeViaHitTest(dict_node, retriesLeft = 12)
+                                    .thenAccept { status: Boolean ->
+                                        result.success(status)
+                                    }.exceptionally { throwable ->
+                                        result.error("e", throwable.message, throwable.stackTrace)
+                                        null
+                                    }
+                            } else {
+                                result.success(false)
+                            }
+                        }
                         "removeNode" -> {
                             val nodeName: String? = call.argument<String>("name")
                             nodeName?.let{
@@ -195,6 +218,7 @@ internal class AndroidARView(
                                     transformationSystem.selectNode(null)
                                     keepNodeSelected = true
                                 }
+                                nodeAnchors.remove(nodeName)?.detach()
                                 val node = arSceneView.scene.findByName(nodeName)
                                 node?.let{
                                     arSceneView.scene.removeChild(node)
@@ -659,6 +683,119 @@ internal class AndroidARView(
             transformationSystem.selectNode(null)
         }
 
+    }
+
+    /// Stable AR placement on Android. Uses `frame.hitTest` against
+    /// detected planes/feature points at screen center, then
+    /// `hit.createAnchor()` — ARCore auto-refines the anchor's pose
+    /// every frame as world tracking evolves, so the AnchorNode
+    /// (parent of the prism) follows the real-world surface point.
+    /// Equivalent of iOS's ARTrackedRaycast; eliminates the visible
+    /// "object slides as I walk" drift seen with plain scene-root
+    /// addNode placement. Retries every 250ms up to `retriesLeft`
+    /// times if no hit yet (early frames before plane estimation
+    /// converges).
+    private fun placeNodeViaHitTest(
+        dict_node: HashMap<String, Any>,
+        retriesLeft: Int
+    ): CompletableFuture<Boolean> {
+        val completableFutureSuccess: CompletableFuture<Boolean> = CompletableFuture()
+
+        val frame = arSceneView.arFrame
+        if (frame == null || frame.camera.trackingState != TrackingState.TRACKING) {
+            scheduleHitTestRetry(dict_node, retriesLeft, completableFutureSuccess)
+            return completableFutureSuccess
+        }
+
+        val centerX = arSceneView.width / 2f
+        val centerY = arSceneView.height / 2f
+        val hits: List<HitResult> = try {
+            frame.hitTest(centerX, centerY)
+        } catch (e: Exception) {
+            emptyList()
+        }
+
+        // Prefer plane hits where the pose is inside the polygon and
+        // the plane is currently tracking; fall back to estimated
+        // surface-normal feature points; last resort: the first hit.
+        val firstHit = hits.firstOrNull { hit ->
+            val t = hit.trackable
+            when (t) {
+                is Plane -> t.trackingState == TrackingState.TRACKING && t.isPoseInPolygon(hit.hitPose)
+                is Point -> t.orientationMode == Point.OrientationMode.ESTIMATED_SURFACE_NORMAL
+                else -> false
+            }
+        } ?: hits.firstOrNull()
+
+        if (firstHit == null) {
+            scheduleHitTestRetry(dict_node, retriesLeft, completableFutureSuccess)
+            return completableFutureSuccess
+        }
+
+        try {
+            val anchor: com.google.ar.core.Anchor = firstHit.createAnchor()
+            val anchorNode = AnchorNode(anchor)
+            anchorNode.setParent(arSceneView.scene)
+
+            val nodeType = dict_node["type"] as Int
+            when (nodeType) {
+                0 -> { // GLTF2 from Flutter assets
+                    val loader: FlutterLoader = FlutterInjector.instance().flutterLoader()
+                    val key: String = loader.getLookupKeyForAsset(dict_node["uri"] as String)
+                    val nodeName = dict_node["name"] as String
+
+                    modelBuilder.makeNodeFromGltf(
+                        viewContext, transformationSystem, objectManagerChannel,
+                        enablePans, enableRotation,
+                        nodeName, key,
+                        dict_node["transformation"] as ArrayList<Double>
+                    ).thenAccept { node ->
+                        anchorNode.addChild(node)
+                        nodeAnchors[nodeName] = anchor
+                        completableFutureSuccess.complete(true)
+                    }.exceptionally { throwable ->
+                        anchor.detach()
+                        anchorNode.setParent(null)
+                        val mainHandler = Handler(viewContext.mainLooper)
+                        val runnable = Runnable {
+                            sessionManagerChannel.invokeMethod(
+                                "onError",
+                                listOf("Unable to load renderable" + dict_node["uri"] as String)
+                            )
+                        }
+                        mainHandler.post(runnable)
+                        completableFutureSuccess.completeExceptionally(throwable)
+                        null
+                    }
+                }
+                else -> {
+                    // Only NodeType.localGLTF2 is supported via raycast for now.
+                    anchor.detach()
+                    anchorNode.setParent(null)
+                    completableFutureSuccess.complete(false)
+                }
+            }
+        } catch (e: Exception) {
+            completableFutureSuccess.completeExceptionally(e)
+        }
+
+        return completableFutureSuccess
+    }
+
+    private fun scheduleHitTestRetry(
+        dict_node: HashMap<String, Any>,
+        retriesLeft: Int,
+        future: CompletableFuture<Boolean>
+    ) {
+        if (retriesLeft <= 0) {
+            future.complete(false)
+            return
+        }
+        Handler(viewContext.mainLooper).postDelayed({
+            placeNodeViaHitTest(dict_node, retriesLeft - 1)
+                .thenAccept { ok -> future.complete(ok) }
+                .exceptionally { t -> future.completeExceptionally(t); null }
+        }, 250)
     }
 
     private fun addNode(dict_node: HashMap<String, Any>, dict_anchor: HashMap<String, Any>? = null): CompletableFuture<Boolean>{

@@ -154,6 +154,14 @@ class ARSessionManager {
     bool handleTaps = true,
     bool handlePans = false, // nodes are not draggable by default
     bool handleRotation = false, // nodes can not be rotated by default
+    // iOS-only — ARKit `environmentTexturing`. OFF by default; flip
+    // to true if the model needs HDR cube-map reflections. Costs
+    // measurable CPU/GPU on older devices (iPhone 11 / A13).
+    bool environmentTexturing = false,
+    // iOS-only — ARKit `worldAlignment`. "gravity" (default) is best
+    // for indoor; "gravityAndHeading" pulls yaw against compass and
+    // is preferable outdoors when heading is reliable.
+    String worldAlignment = 'gravity',
   }) {
     _channel.invokeMethod<void>('init', {
       'showAnimatedGuide': showAnimatedGuide,
@@ -165,6 +173,8 @@ class ARSessionManager {
       'handleTaps': handleTaps,
       'handlePans': handlePans,
       'handleRotation': handleRotation,
+      'environmentTexturing': environmentTexturing,
+      'worldAlignment': worldAlignment,
     });
   }
 

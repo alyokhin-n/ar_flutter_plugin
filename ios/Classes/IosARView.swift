@@ -18,6 +18,13 @@ class IosARView: NSObject, FlutterPlatformView, ARSCNViewDelegate, UIGestureReco
     
     var cancellableCollection = Set<AnyCancellable>() //Used to store all cancellables in (needed for working with Futures)
     var anchorCollection = [String: ARAnchor]() //Used to bookkeep all anchors created by Flutter calls
+    /// Tracked raycasts per node name. ARTrackedRaycast asks ARKit to
+    /// re-run the raycast every frame and call back with refined
+    /// world-space results — the canonical mechanism for stable
+    /// placement that follows real-world surfaces as ARKit's world
+    /// understanding evolves. Stop them via `stopTracking()` on node
+    /// removal to free their per-frame budget.
+    private var trackedRaycasts = [String: ARTrackedRaycast]()
     
     private var cloudAnchorHandler: CloudAnchorHandler? = nil
     private var arcoreSession: GARSession? = nil
@@ -53,7 +60,13 @@ class IosARView: NSObject, FlutterPlatformView, ARSCNViewDelegate, UIGestureReco
         self.sceneView.delegate = self
         self.coachingView.delegate = self
         self.sceneView.session.run(configuration)
-        self.sceneView.session.delegate = self
+        // NOTE: `sceneView.session.delegate = self` is set conditionally in
+        // `initializeARView` only when `arcoreMode` is enabled (the only
+        // place `session(_:didUpdate frame:)` does meaningful work). For
+        // non-ARCore mode keeping the delegate unset prevents ARKit from
+        // queuing frames against our main-thread callback — which the
+        // runtime warns about with "delegate retaining N ARFrames" and
+        // which contributes to tracking instability.
 
         self.sessionManagerChannel.setMethodCallHandler(self.onSessionMethodCalled)
         self.objectManagerChannel.setMethodCallHandler(self.onObjectMethodCalled)
@@ -134,8 +147,26 @@ class IosARView: NSObject, FlutterPlatformView, ARSCNViewDelegate, UIGestureReco
                         }).store(in: &self.cancellableCollection)
                 }
                 break
+            case "addNodeRaycast":
+                let dict_node = (arguments!["node"] as? Dictionary<String, Any>) ?? arguments!
+                var screenPoint: CGPoint = self.sceneViewCenter()
+                if let sp = arguments!["screenPoint"] as? Dictionary<String, Any>,
+                   let x = sp["x"] as? Double,
+                   let y = sp["y"] as? Double {
+                    screenPoint = CGPoint(x: x, y: y)
+                }
+                placeNodeViaTrackedRaycast(
+                    dict_node: dict_node,
+                    screenPoint: screenPoint,
+                    retriesLeft: 12,
+                    result: result
+                )
+                break
             case "removeNode":
                 if let name = arguments!["name"] as? String {
+                    if let tracked = trackedRaycasts.removeValue(forKey: name) {
+                        tracked.stopTracking()
+                    }
                     sceneView.scene.rootNode.childNode(withName: name, recursively: true)?.removeFromParentNode()
                 }
                 break
@@ -230,7 +261,22 @@ class IosARView: NSObject, FlutterPlatformView, ARSCNViewDelegate, UIGestureReco
     func initializeARView(arguments: Dictionary<String,Any>, result: FlutterResult){
         // Set plane detection configuration
         self.configuration = ARWorldTrackingConfiguration()
-        self.configuration.environmentTexturing = .automatic
+        // Environment texturing is OFF by default — `.automatic` forces ARKit
+        // to continuously generate HDR cube-maps from the camera feed, which
+        // costs measurable CPU/GPU on older devices (iPhone 11 / A13) and
+        // does not contribute to placement quality for matte models.
+        if let envTex = arguments["environmentTexturing"] as? Bool, envTex {
+            self.configuration.environmentTexturing = .automatic
+        } else {
+            self.configuration.environmentTexturing = .none
+        }
+        // World alignment: `.gravity` (default, indoor-friendly) or
+        // `.gravityAndHeading` (uses magnetometer to fix yaw against true
+        // north — better outdoor stability when compass is reliable).
+        if let align = arguments["worldAlignment"] as? String,
+           align == "gravityAndHeading" {
+            self.configuration.worldAlignment = .gravityAndHeading
+        }
         if let planeDetectionConfig = arguments["planeDetectionConfig"] as? Int {
             switch planeDetectionConfig {
                 case 1: 
@@ -806,5 +852,131 @@ extension IosARView: ARCoachingOverlayViewDelegate {
     func coachingOverlayViewDidRequestSessionReset(_ coachingOverlayView: ARCoachingOverlayView) {
         // Reset the session.
         self.sceneView.session.run(configuration, options: [.resetTracking])
+    }
+
+    // MARK: - Tracked-raycast placement
+
+    private func sceneViewCenter() -> CGPoint {
+        return CGPoint(x: sceneView.bounds.midX, y: sceneView.bounds.midY)
+    }
+
+    /// Stable AR placement. Performs a one-shot raycast against
+    /// estimated planes; on hit, builds the node + parents to scene
+    /// root + spins up an `ARTrackedRaycast` whose update handler
+    /// rewrites the node's world position every time ARKit refines
+    /// its understanding of the surface. This is the mechanism Apple's
+    /// official `Placing Objects` sample uses and what fixes the
+    /// "object follows the camera as I walk around it" drift on iPhone
+    /// 11. If no hit yet (ARKit still bootstrapping plane estimates),
+    /// retries every 250ms up to `retriesLeft`.
+    private func placeNodeViaTrackedRaycast(
+        dict_node: [String: Any],
+        screenPoint: CGPoint,
+        retriesLeft: Int,
+        result: @escaping FlutterResult
+    ) {
+        guard let query = sceneView.raycastQuery(
+            from: screenPoint,
+            allowing: .estimatedPlane,
+            alignment: .any
+        ) else {
+            result(false)
+            return
+        }
+
+        let oneShot = sceneView.session.raycast(query)
+        if let firstHit = oneShot.first {
+            attachNodeWithTrackedRaycast(
+                dict_node: dict_node,
+                query: query,
+                initialTransform: firstHit.worldTransform,
+                result: result
+            )
+            return
+        }
+
+        if retriesLeft <= 0 {
+            result(false)
+            return
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            self?.placeNodeViaTrackedRaycast(
+                dict_node: dict_node,
+                screenPoint: screenPoint,
+                retriesLeft: retriesLeft - 1,
+                result: result
+            )
+        }
+    }
+
+    private func attachNodeWithTrackedRaycast(
+        dict_node: [String: Any],
+        query: ARRaycastQuery,
+        initialTransform: simd_float4x4,
+        result: @escaping FlutterResult
+    ) {
+        guard let nodeType = dict_node["type"] as? Int, nodeType == 0 else {
+            // Only NodeType.localGLTF2 is supported via raycast for now.
+            // Other node types should keep using the legacy `addNode`.
+            result(false)
+            return
+        }
+        guard let nodeName = dict_node["name"] as? String,
+              let uri = dict_node["uri"] as? String else {
+            result(false)
+            return
+        }
+
+        let key = FlutterDartProject.lookupKey(forAsset: uri)
+        guard let node = self.modelBuilder.makeNodeFromGltf(
+            name: nodeName,
+            modelPath: key,
+            transformation: dict_node["transformation"] as? Array<NSNumber>
+        ) else {
+            self.sessionManagerChannel.invokeMethod(
+                "onError",
+                arguments: ["Unable to load renderable \(uri)"]
+            )
+            result(false)
+            return
+        }
+
+        // Anchor at the raycast hit point. Position only — orientation
+        // and scale are kept from the model's own transform so the
+        // prism stays gravity-up regardless of which surface the
+        // raycast lands on (floor vs. wall).
+        let pos = simd_float3(
+            initialTransform.columns.3.x,
+            initialTransform.columns.3.y,
+            initialTransform.columns.3.z
+        )
+        node.simdWorldPosition = pos
+        sceneView.scene.rootNode.addChildNode(node)
+
+        // Continuous refinement: ARKit re-runs the raycast each frame
+        // and calls back when the result changes. Updating
+        // `simdWorldPosition` (only) preserves scale + orientation
+        // baked in by the model builder.
+        let tracked = sceneView.session.trackedRaycast(query) { [weak self] (results) in
+            guard let self = self,
+                  let updated = results.first else { return }
+            if let target = self.sceneView.scene.rootNode.childNode(
+                withName: nodeName,
+                recursively: true
+            ) {
+                let p = simd_float3(
+                    updated.worldTransform.columns.3.x,
+                    updated.worldTransform.columns.3.y,
+                    updated.worldTransform.columns.3.z
+                )
+                target.simdWorldPosition = p
+            }
+        }
+        if let tracked = tracked {
+            trackedRaycasts[nodeName] = tracked
+        }
+
+        result(true)
     }
 }

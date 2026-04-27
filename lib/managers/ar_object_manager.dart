@@ -141,6 +141,48 @@ class ARObjectManager {
     }
   }
 
+  /// Place [node] using a stable, drift-corrected raycast against
+  /// detected planes / feature points at the given screen point
+  /// (defaults to view center).
+  ///
+  /// On iOS this routes to `ARTrackedRaycast`, on Android to
+  /// `Frame.hitTest` + `Anchor.createAnchor`. Both mechanisms are
+  /// continuously refined by the AR framework as world tracking
+  /// evolves — that's the canonical way to make a virtual object
+  /// stay locked to a real-world spot when the user walks around it,
+  /// squats, or looks from above. Plain [addNode] (which attaches
+  /// to scene root in fixed world coordinates at placement time)
+  /// drifts visibly with the camera as the world frame is refined.
+  ///
+  /// Currently supports `NodeType.localGLTF2` only on both
+  /// platforms; other types should keep using [addNode]. Returns
+  /// `true` on success, `false` if no surface could be hit within
+  /// the platform's retry budget.
+  Future<bool?> addNodeRaycast(ARNode node, {Offset? screenPoint}) async {
+    try {
+      node.transformNotifier.addListener(() {
+        _channel.invokeMethod<void>('transformationChanged', {
+          'name': node.name,
+          'transformation':
+              MatrixValueNotifierConverter().toJson(node.transformNotifier),
+        });
+      });
+      final Map<String, dynamic> args = <String, dynamic>{
+        'node': node.toMap(),
+      };
+      if (screenPoint != null) {
+        args['screenPoint'] = <String, double>{
+          'x': screenPoint.dx,
+          'y': screenPoint.dy,
+        };
+      }
+      return await _channel.invokeMethod<bool>('addNodeRaycast', args);
+    } on PlatformException catch (e) {
+      print('addNodeRaycast: ' + e.toString());
+      return false;
+    }
+  }
+
   /// Remove given node from the AR Scene
   removeNode(ARNode node) {
     _channel.invokeMethod<String>('removeNode', {'name': node.name});
