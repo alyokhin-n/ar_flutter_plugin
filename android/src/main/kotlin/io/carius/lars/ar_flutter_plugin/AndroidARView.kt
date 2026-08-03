@@ -357,6 +357,38 @@ internal class AndroidARView(
     override fun dispose() {
         // Destroy AR session
         Log.d(TAG, "dispose called")
+        // FIRST, before anything is torn down: stop listening to the host
+        // Activity.
+        //
+        // `setupLifeCycle` registers these callbacks on the APPLICATION, whose
+        // lifetime is the whole process, and nothing ever unregistered them.
+        // Every destroyed AndroidARView therefore stayed subscribed: the next
+        // time the app was backgrounded and resumed, each corpse ran its own
+        // `onResume()` and opened a fresh ARCore session against an ArSceneView
+        // that is no longer attached to anything. Three trips into "place a
+        // control point" left three invisible sessions holding the camera and
+        // draining the battery for the rest of the process's life.
+        //
+        // This is the only correct place for the unregister. `onPause()` /
+        // `onActivityStopped` are NOT: they run on every app background, and
+        // dropping the callbacks there would leave a LIVE AR screen unable to
+        // resume its session when the coach comes back — AR would simply stop
+        // working. `dispose()` is the PlatformView teardown contract: it is
+        // reached from Flutter disposing the view and from the Dart-side
+        // `"dispose"` method call, and after it the view is dead, so any
+        // further lifecycle callback can only resurrect a corpse.
+        // `unregisterActivityLifecycleCallbacks` is a no-op for an
+        // unregistered instance, so the two entry points cannot conflict.
+        // Guarded on `isInitialized` because `activityLifecycleCallbacks` is
+        // `lateinit` and `setupLifeCycle` could have thrown before assigning.
+        try {
+            if (this::activityLifecycleCallbacks.isInitialized) {
+                activity.application.unregisterActivityLifecycleCallbacks(
+                        this.activityLifecycleCallbacks)
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
         try {
             onPause()
             onDestroy()

@@ -82,9 +82,65 @@ class IosARView: NSObject, FlutterPlatformView, ARSCNViewDelegate, UIGestureReco
         // runtime warns about with "delegate retaining N ARFrames" and
         // which contributes to tracking instability.
 
-        self.sessionManagerChannel.setMethodCallHandler(self.onSessionMethodCalled)
-        self.objectManagerChannel.setMethodCallHandler(self.onObjectMethodCalled)
-        self.anchorManagerChannel.setMethodCallHandler(self.onAnchorMethodCalled)
+        // `[weak self]` is load-bearing, not style. `setMethodCallHandler`
+        // registers the handler with the ENGINE's binary messenger, which
+        // retains it for the life of the channel name; handing it a bound
+        // method (`self.onSessionMethodCalled`) captured `self` strongly and
+        // made the engine an owner of this view. The reference count could
+        // then never reach zero on its own, `deinit` never ran, and the
+        // ARKit session started in this initialiser kept running — camera
+        // indicator lit, tracking active — for the rest of the app's life.
+        //
+        // The only thing that ever broke that hold was `onDispose`, which is
+        // reachable exclusively through the Dart `"dispose"` method call; and
+        // Dart only sends it once `onARViewCreated` has handed the app a
+        // session manager. A coach who opened "place a control point" and hit
+        // back before that callback landed — routine on older iPhones — left
+        // the view with no owner willing to release it and a session nobody
+        // could stop.
+        self.sessionManagerChannel.setMethodCallHandler { [weak self] call, result in
+            self?.onSessionMethodCalled(call, result)
+        }
+        self.objectManagerChannel.setMethodCallHandler { [weak self] call, result in
+            self?.onObjectMethodCalled(call, result)
+        }
+        self.anchorManagerChannel.setMethodCallHandler { [weak self] call, result in
+            self?.onAnchorMethodCalled(call, result)
+        }
+    }
+
+    /// Last-resort teardown for the view being released without a Dart
+    /// `"dispose"` ever arriving (fast back-out before `onARViewCreated`,
+    /// an engine-driven platform-view teardown, a detached engine).
+    ///
+    /// `deinit` is the correct place precisely because of WHEN it can run:
+    /// only after the last strong reference is gone. While the AR screen is
+    /// on screen the platform-views controller holds one, so this cannot fire
+    /// under a live session and cannot break AR. Once it does fire the view is
+    /// already unreachable, so pausing is the only remaining useful act. It is
+    /// dead code without the `[weak self]` handlers above — together they are
+    /// the fix.
+    ///
+    /// Runs on whichever thread released the last reference; Flutter releases
+    /// platform views on the platform (main) thread, and nothing here escapes
+    /// `self`.
+    ///
+    /// Kept to the minimum that actually matters. Every delegate this class
+    /// installs (`ARSCNView.delegate`, `ARCoachingOverlayView.delegate`,
+    /// `ARSession.delegate`) is a weak reference and already reads nil once
+    /// deallocation has begun, so re-nilling those here would be ceremony;
+    /// stopping the per-frame raycast budget and the session is not.
+    deinit {
+        for (_, tracked) in trackedRaycasts {
+            tracked.stopTracking()
+        }
+        trackedRaycasts.removeAll()
+        sceneView.session.pause()
+        // Drop the engine-side registrations too, so the channel names do not
+        // keep a dangling handler around after the view is gone.
+        sessionManagerChannel.setMethodCallHandler(nil)
+        objectManagerChannel.setMethodCallHandler(nil)
+        anchorManagerChannel.setMethodCallHandler(nil)
     }
 
     func view() -> UIView {
