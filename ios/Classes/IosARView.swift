@@ -31,6 +31,12 @@ class IosARView: NSObject, FlutterPlatformView, ARSCNViewDelegate, UIGestureReco
     /// A raw write of every update produced visible drift because each
     /// frame's plane estimate fluctuates by mm-cm even at rest.
     private var smoothedSurfacePositions = [String: simd_float3]()
+    /// Guards [performTeardown] so the session is paused and the engine
+    /// channels are unregistered exactly once, no matter which lifetime path
+    /// gets there first. A plain flag is enough: `onDispose` keeps the view
+    /// alive for the duration of the call, so `deinit` cannot run concurrently
+    /// with it.
+    private var didTearDown = false
     
     private var cloudAnchorHandler: CloudAnchorHandler? = nil
     private var arcoreSession: GARSession? = nil
@@ -121,9 +127,12 @@ class IosARView: NSObject, FlutterPlatformView, ARSCNViewDelegate, UIGestureReco
     /// dead code without the `[weak self]` handlers above — together they are
     /// the fix.
     ///
-    /// Runs on whichever thread released the last reference; Flutter releases
-    /// platform views on the platform (main) thread, and nothing here escapes
-    /// `self`.
+    /// `deinit` runs on whichever thread released the last reference, and that
+    /// is NOT guaranteed to be the main thread: Crashlytics shows SceneKit's
+    /// `com.apple.scenekit.renderingQueue` releasing it on fast back-out, and
+    /// calling `pause()` / `setMethodCallHandler(nil)` there aborts the
+    /// Flutter engine. The actual teardown therefore always hops to main;
+    /// `self` is never captured, only the objects it owns.
     ///
     /// Kept to the minimum that actually matters. Every delegate this class
     /// installs (`ARSCNView.delegate`, `ARCoachingOverlayView.delegate`,
@@ -131,16 +140,69 @@ class IosARView: NSObject, FlutterPlatformView, ARSCNViewDelegate, UIGestureReco
     /// deallocation has begun, so re-nilling those here would be ceremony;
     /// stopping the per-frame raycast budget and the session is not.
     deinit {
-        for (_, tracked) in trackedRaycasts {
+        guard claimTeardown() else { return }
+
+        // Copy before the escaping block: `self` cannot be captured in
+        // `deinit`, and these strong references are what keep `sceneView` and
+        // `coachingView` alive until their final release on the main thread.
+        let sceneView = self.sceneView
+        let coachingView = self.coachingView
+        let channels = [
+            sessionManagerChannel,
+            objectManagerChannel,
+            anchorManagerChannel,
+        ]
+        let raycasts = Array(trackedRaycasts.values)
+
+        if Thread.isMainThread {
+            IosARView.performTeardown(
+                sceneView: sceneView,
+                coachingView: coachingView,
+                channels: channels,
+                raycasts: raycasts
+            )
+        } else {
+            DispatchQueue.main.async {
+                IosARView.performTeardown(
+                    sceneView: sceneView,
+                    coachingView: coachingView,
+                    channels: channels,
+                    raycasts: raycasts
+                )
+            }
+        }
+    }
+
+    /// Claims the one-and-only teardown slot. The loser of the race does
+    /// nothing: its teardown has already been (or is about to be) performed.
+    private func claimTeardown() -> Bool {
+        if didTearDown { return false }
+        didTearDown = true
+        return true
+    }
+
+    /// Stops per-frame raycasts, pauses the AR session and drops the engine
+    /// handlers. Must run on the main thread: `pause()` and
+    /// `setMethodCallHandler(nil)` touch ARKit and the Flutter engine, and the
+    /// captured UIKit views must finish deallocating there too.
+    ///
+    /// `coachingView` is not used here, and that is deliberate: passing it in
+    /// is what makes the caller's escaping block capture it, keeping the
+    /// `UIView` alive until this call finishes on the main thread. Before
+    /// `initializeARView` adds it to `sceneView` it has no other owner.
+    private static func performTeardown(
+        sceneView: ARSCNView,
+        coachingView: ARCoachingOverlayView,
+        channels: [FlutterMethodChannel],
+        raycasts: [ARTrackedRaycast]
+    ) {
+        for tracked in raycasts {
             tracked.stopTracking()
         }
-        trackedRaycasts.removeAll()
         sceneView.session.pause()
-        // Drop the engine-side registrations too, so the channel names do not
-        // keep a dangling handler around after the view is gone.
-        sessionManagerChannel.setMethodCallHandler(nil)
-        objectManagerChannel.setMethodCallHandler(nil)
-        anchorManagerChannel.setMethodCallHandler(nil)
+        for channel in channels {
+            channel.setMethodCallHandler(nil)
+        }
     }
 
     func view() -> UIView {
@@ -148,12 +210,20 @@ class IosARView: NSObject, FlutterPlatformView, ARSCNViewDelegate, UIGestureReco
     }
 
     func onDispose(_ result:FlutterResult) {
-                sceneView.session.pause()
-                self.sessionManagerChannel.setMethodCallHandler(nil)
-                self.objectManagerChannel.setMethodCallHandler(nil)
-                self.anchorManagerChannel.setMethodCallHandler(nil)
-                result(nil)
-            }
+        if claimTeardown() {
+            IosARView.performTeardown(
+                sceneView: sceneView,
+                coachingView: coachingView,
+                channels: [
+                    sessionManagerChannel,
+                    objectManagerChannel,
+                    anchorManagerChannel,
+                ],
+                raycasts: Array(trackedRaycasts.values)
+            )
+        }
+        result(nil)
+    }
 
     func onSessionMethodCalled(_ call :FlutterMethodCall, _ result:FlutterResult) {
         let arguments = call.arguments as? Dictionary<String, Any>
@@ -189,7 +259,6 @@ class IosARView: NSObject, FlutterPlatformView, ARSCNViewDelegate, UIGestureReco
                 }
             case "dispose":
                 onDispose(result)
-                result(nil)
                 break
             default:
                 result(FlutterMethodNotImplemented)
